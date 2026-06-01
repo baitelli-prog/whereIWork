@@ -1,0 +1,16 @@
+# Minimal Supabase config. Generated/expanded by `supabase init`.
+# Committed so the project structure is reproducible.
+
+project_id = "glasshouse"
+
+[functions.prospects]
+verify_jwt = true   # require a logged-in user to call this endpoint
+
+[functions.send-campaign]
+verify_jwt = true
+
+[functions.send-reply]
+verify_jwt = true
+
+[functions.sms-inbound]
+verify_jwt = false  # Twilio can't send a Supabase JWT; we verify its signature instead
