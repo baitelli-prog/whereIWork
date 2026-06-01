@@ -1,0 +1,26 @@
+name: Deploy backend
+
+# Runs on GitHub's servers whenever you push changes to the backend.
+# Deploys database migrations and all Edge Functions to your Supabase project.
+# Nothing installs on your computer.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "supabase/**"          # only redeploy when backend files change
+  workflow_dispatch: {}        # also lets you run it manually from the Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
