@@ -1,5 +1,8 @@
 import React, { useState, useMemo } from "react";
 import { useGlassHouse } from "./hooks/useGlassHouse";
+import RevealMap from "./RevealMap";
+
+const HAS_MAPS_KEY = !!import.meta.env.VITE_GOOGLE_MAPS_KEY;
 import {
   Map, RefreshCw, Send, Columns, Megaphone, Inbox, Settings as Cog,
   MessageSquare, HelpCircle, Database, Search, Plus, ChevronLeft,
@@ -1039,7 +1042,9 @@ export default function App() {
   const view = useMemo(() => {
     if (settingsActive) return <SettingsView />;
     switch (active) {
-      case "reveal": return <Reveal onCreateGroup={addGroup} goOutreach={() => { setActive("outreach"); setSettingsActive(false); }} boardLeads={allLeads} focusLead={focusLeadObj} onOpenLead={openLead} clearFocus={() => setFocusLeadId(null)} />;
+      case "reveal": return HAS_MAPS_KEY
+        ? <RevealMap onCreateGroup={addGroup} boardLeads={allLeads} focusLead={focusLeadObj} onOpenLead={openLead} clearFocus={() => setFocusLeadId(null)} />
+        : <Reveal onCreateGroup={addGroup} goOutreach={() => { setActive("outreach"); setSettingsActive(false); }} boardLeads={allLeads} focusLead={focusLeadObj} onOpenLead={openLead} clearFocus={() => setFocusLeadId(null)} />;
       case "reengage": return <ReEngage />;
       case "outreach": return <Outreach groups={groups} onSend={sendCampaign} sentGroupNames={sentGroupNames} />;
       case "salesboard": return <SalesBoard campaigns={campaigns} leads={leads} goOutreach={() => { setActive("outreach"); setSettingsActive(false); }} onMove={moveLead} onOpen={openLead} onViewMap={viewLeadOnMap} onReset={refresh} />;
