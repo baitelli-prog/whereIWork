@@ -1,24 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
+import { supabase } from "./lib/supabase";
 
-/* ============================================================================
-   RevealMap — real Google Maps version of the GlassHouse "Reveal" screen.
+/* RevealMap — draw an area, sample real addresses (Google reverse-geocode),
+   then "Reveal" to enrich them with real owner data via Tracerfy.
+   Phase 1: draw -> grid-sample points inside -> reverse-geocode -> dedupe -> candidates.
+   Phase 2: Reveal -> enrich-prospect per address (Tracerfy $0.20/hit) -> real owners.
+   Only revealed owners can become a group. Env: VITE_GOOGLE_MAPS_KEY */
 
-   Draws polygons via manual click listeners (the Drawing library was deprecated
-   by Google in Aug 2025 and removed May 2026, so we don't use DrawingManager).
-   Uses the geometry library only for the point-in-polygon test.
-
-   Props (same shape the app's <Reveal> uses):
-     onCreateGroup({ name, contacts, prospects:[{name,addr,phone,lat,lng,...}] })
-     boardLeads:  [{ id, name, addr, lat, lng, stage }]   // existing leads → pins
-     focusLead:   { id, lat, lng } | null                 // pan/center here
-     onOpenLead(id)                                        // click a lead pin
-     clearFocus()
-
-   Env: VITE_GOOGLE_MAPS_KEY must be set (Vercel + local .env).
-============================================================================ */
-
-const C = { accent: "#c2632a", ink: "#1d2939", sub: "#667085", line: "#e7e3dd", panel: "#faf8f5" };
+const C = { accent: "#c2632a", ink: "#1d2939", sub: "#667085", line: "#e7e3dd", green: "#0a8a4a", red: "#b42318" };
 const ORLANDO = { lat: 28.5384, lng: -81.3789 };
+const MAX_POINTS = 60;
+const GRID = 8;
 
 let _mapsPromise = null;
 function loadMaps(key) {
@@ -28,7 +20,6 @@ function loadMaps(key) {
     const cb = "__ghMapsInit_" + Math.random().toString(36).slice(2);
     window[cb] = () => resolve(window.google.maps);
     const s = document.createElement("script");
-    // geometry only — no deprecated 'drawing' library
     s.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry&callback=${cb}&v=weekly&loading=async`;
     s.async = true;
     s.onerror = () => reject(new Error("Google Maps failed to load"));
@@ -37,35 +28,38 @@ function loadMaps(key) {
   return _mapsPromise;
 }
 
-export default function RevealMap({ onCreateGroup, boardLeads = [], focusLead, onOpenLead, clearFocus }) {
+export default function RevealMap({ onCreateGroup, boardLeads = [], focusLead, onOpenLead }) {
   const mapEl = useRef(null);
   const map = useRef(null);
   const maps = useRef(null);
-  const drawing = useRef(false);
-  const points = useRef([]);            // {lat,lng} vertices being drawn
-  const tempPath = useRef(null);        // polyline while drawing
-  const vertexDots = useRef([]);        // markers for each clicked vertex
-  const polygon = useRef(null);         // finished polygon
-  const leadPins = useRef([]);          // markers for board leads
+  const geocoder = useRef(null);
+  const points = useRef([]);
+  const tempPath = useRef(null);
+  const vertexDots = useRef([]);
+  const polygon = useRef(null);
+  const leadPins = useRef([]);
 
   const [ready, setReady] = useState(false);
   const [err, setErr] = useState(null);
-  const [mode, setMode] = useState(null);     // 'polygon' | 'box' | null
-  const [captured, setCaptured] = useState([]);
+  const [mode, setMode] = useState(null);
+  const [phase, setPhase] = useState("idle");
+  const [candidates, setCandidates] = useState([]);
+  const [revealed, setRevealed] = useState([]);
   const [excluded, setExcluded] = useState({});
   const [groupName, setGroupName] = useState("");
   const [created, setCreated] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [note, setNote] = useState("");
 
   const key = import.meta.env.VITE_GOOGLE_MAPS_KEY;
 
-  /* ---- init map ---- */
   useEffect(() => {
     if (!key) { setErr("no-key"); return; }
     let dead = false;
     loadMaps(key).then((m) => {
       if (dead) return;
       maps.current = m;
+      geocoder.current = new m.Geocoder();
       map.current = new m.Map(mapEl.current, {
         center: ORLANDO, zoom: 13, mapTypeControl: false, streetViewControl: false,
         fullscreenControl: false, clickableIcons: false,
@@ -75,260 +69,247 @@ export default function RevealMap({ onCreateGroup, boardLeads = [], focusLead, o
     return () => { dead = true; };
   }, [key]);
 
-  /* ---- mock homeowner lookup; swap for your prospects edge function later ---- */
-  const lookupInBounds = useCallback(async (path) => {
-    // path: array of {lat,lng}. We generate plausible homes inside its bbox,
-    // then keep those actually inside the polygon.
+  const reverseGeocode = (pt) => new Promise((resolve, reject) => {
+    geocoder.current.geocode({ location: pt }, (results, status) => {
+      if (status !== "OK" || !results?.length) return reject(status);
+      const r = results.find((x) => x.types.includes("street_address")) || results[0];
+      const get = (type) => r.address_components.find((c) => c.types.includes(type))?.long_name || "";
+      const streetNum = get("street_number");
+      const route = get("route");
+      if (!streetNum || !route) return reject("not-a-street-address");
+      const addr = `${streetNum} ${route}`;
+      const city = get("locality") || get("sublocality") || get("administrative_area_level_2");
+      const state = r.address_components.find((c) => c.types.includes("administrative_area_level_1"))?.short_name || "";
+      const zip = get("postal_code");
+      resolve({ id: addr + "|" + zip, key: (addr + city + zip).toLowerCase(), addr, city, state, zip,
+        lat: r.geometry.location.lat(), lng: r.geometry.location.lng() });
+    });
+  });
+
+  const sampleAddresses = useCallback(async (path) => {
     const m = maps.current;
     const poly = new m.Polygon({ paths: path });
     let minLat = 90, maxLat = -90, minLng = 180, maxLng = -180;
     path.forEach((p) => { minLat = Math.min(minLat, p.lat); maxLat = Math.max(maxLat, p.lat); minLng = Math.min(minLng, p.lng); maxLng = Math.max(maxLng, p.lng); });
-    const names = ["A. Carter","M. Nguyen","R. Patel","L. Reyes","J. Brooks","S. Flores","D. Cole","K. Hughes","N. Sousa","B. Russo","D. Watson","M. Beck"];
-    const streets = ["Reymont St","Oak Quarry Dr","Crest Ave","Heron Bay","Maple Glen","Laureate Blvd"];
-    const out = [];
-    let tries = 0;
-    while (out.length < 24 && tries < 400) {
-      tries++;
-      const lat = minLat + Math.random() * (maxLat - minLat);
-      const lng = minLng + Math.random() * (maxLng - minLng);
-      if (!m.geometry.poly.containsLocation(new m.LatLng(lat, lng), poly)) continue;
-      const value = Math.round(280 + Math.random() * 620) * 1000;
-      out.push({
-        id: "h" + tries,
-        name: names[out.length % names.length],
-        addr: `${100 + Math.floor(Math.random() * 9899)} ${streets[out.length % streets.length]}, Orlando, FL`,
-        phone: `(407) ${200 + Math.floor(Math.random() * 799)}-${1000 + Math.floor(Math.random() * 8999)}`,
-        value, equity: Math.round(value * (0.3 + Math.random() * 0.5)),
-        beds: 2 + Math.floor(Math.random() * 4), sqft: 1200 + Math.floor(Math.random() * 2600),
-        year: 1975 + Math.floor(Math.random() * 48), lat, lng, dnc: Math.random() < 0.1,
-      });
+    const inside = [];
+    for (let i = 0; i <= GRID; i++) for (let j = 0; j <= GRID; j++) {
+      const lat = minLat + (i / GRID) * (maxLat - minLat);
+      const lng = minLng + (j / GRID) * (maxLng - minLng);
+      if (m.geometry.poly.containsLocation(new m.LatLng(lat, lng), poly)) inside.push({ lat, lng });
     }
     poly.setMap(null);
-    return out.filter((h) => !h.dnc);
+    const sampled = inside.slice(0, MAX_POINTS);
+    setPhase("sampling");
+    setProgress({ done: 0, total: sampled.length });
+    setNote(inside.length > MAX_POINTS ? `Area is large — sampling ${MAX_POINTS} of ~${inside.length} points.` : "");
+    const seen = new Set(); const out = [];
+    for (let k = 0; k < sampled.length; k++) {
+      try { const addr = await reverseGeocode(sampled[k]); if (addr && !seen.has(addr.key)) { seen.add(addr.key); out.push(addr); } } catch {}
+      setProgress({ done: k + 1, total: sampled.length });
+    }
+    setCandidates(out); setExcluded({}); setRevealed([]); setCreated(false); setPhase("candidates");
+    if (!out.length) setNote("No addresses resolved here — try a denser residential block.");
   }, []);
 
-  /* ---- finish a drawn shape ---- */
-  const finishShape = useCallback(async (path) => {
-    const m = maps.current;
-    // draw the filled polygon
-    if (polygon.current) polygon.current.setMap(null);
-    polygon.current = new m.Polygon({
-      paths: path, map: map.current, strokeColor: C.accent, strokeWeight: 2,
-      fillColor: C.accent, fillOpacity: 0.12, clickable: false,
-    });
-    setBusy(true);
-    const homes = await lookupInBounds(path);
-    setBusy(false);
-    setCaptured(homes);
-    setExcluded({});
-    setCreated(false);
-  }, [lookupInBounds]);
+  const reveal = useCallback(async () => {
+    const list = candidates.filter((c) => !excluded[c.id]);
+    if (!list.length) return;
+    setPhase("revealing");
+    setProgress({ done: 0, total: list.length });
+    const out = [];
+    for (let k = 0; k < list.length; k++) {
+      const c = list[k];
+      try {
+        const { data, error } = await supabase.functions.invoke("enrich-prospect", { body: { address: c.addr, city: c.city, state: c.state, zip: c.zip } });
+        if (!error && data?.found) out.push({
+          id: c.id, name: data.name || "(owner unknown)", addr: `${c.addr}, ${c.city}, ${c.state} ${c.zip}`,
+          phone: data.phone, email: data.email, dnc: data.dnc, litigator: data.litigator,
+          value: data.home_value, equity: data.equity, beds: data.beds, sqft: data.sqft, year: data.year_built,
+          lat: data.lat ?? c.lat, lng: data.lng ?? c.lng, roofCat: data.roof_category, ownerOccupied: data.owner_occupied,
+        });
+      } catch {}
+      setProgress({ done: k + 1, total: list.length });
+    }
+    setRevealed(out); setExcluded({}); setPhase("revealed");
+    setNote(out.length ? "" : "No owners found for these addresses (not in Tracerfy's database).");
+  }, [candidates, excluded]);
 
-  /* ---- clear everything drawn ---- */
+  const finishShape = useCallback((path) => {
+    const m = maps.current;
+    if (polygon.current) polygon.current.setMap(null);
+    polygon.current = new m.Polygon({ paths: path, map: map.current, strokeColor: C.accent, strokeWeight: 2, fillColor: C.accent, fillOpacity: 0.12, clickable: false });
+    sampleAddresses(path);
+  }, [sampleAddresses]);
+
   const clearDrawing = useCallback(() => {
-    drawing.current = false;
     points.current = [];
     if (tempPath.current) { tempPath.current.setMap(null); tempPath.current = null; }
     vertexDots.current.forEach((d) => d.setMap(null)); vertexDots.current = [];
     if (polygon.current) { polygon.current.setMap(null); polygon.current = null; }
-    setCaptured([]); setExcluded({}); setGroupName(""); setCreated(false); setMode(null);
+    setCandidates([]); setRevealed([]); setExcluded({}); setGroupName(""); setCreated(false); setMode(null); setPhase("idle"); setNote("");
   }, []);
 
-  /* ---- polygon drawing via map clicks ---- */
   useEffect(() => {
     if (!ready || mode !== "polygon") return;
     const m = maps.current, gmap = map.current;
-    clearShapeOnly();
-    drawing.current = true;
+    if (polygon.current) { polygon.current.setMap(null); polygon.current = null; }
     points.current = [];
-
     const clickL = gmap.addListener("click", (e) => {
       const pt = { lat: e.latLng.lat(), lng: e.latLng.lng() };
       points.current.push(pt);
-      const dot = new m.Marker({
-        position: pt, map: gmap,
-        icon: { path: m.SymbolPath.CIRCLE, scale: 5, fillColor: C.accent, fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2 },
-      });
+      const dot = new m.Marker({ position: pt, map: gmap, icon: { path: m.SymbolPath.CIRCLE, scale: 5, fillColor: C.accent, fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2 } });
       vertexDots.current.push(dot);
       if (tempPath.current) tempPath.current.setMap(null);
       tempPath.current = new m.Polyline({ path: points.current, map: gmap, strokeColor: C.accent, strokeWeight: 2 });
     });
-
-    const dblL = gmap.addListener("dblclick", (e) => {
-      e.stop?.();
+    const dblL = gmap.addListener("dblclick", () => {
       if (points.current.length >= 3) {
         const path = [...points.current];
-        // cleanup the in-progress drawing visuals
         if (tempPath.current) { tempPath.current.setMap(null); tempPath.current = null; }
         vertexDots.current.forEach((d) => d.setMap(null)); vertexDots.current = [];
-        drawing.current = false;
-        setMode(null);
-        finishShape(path);
+        setMode(null); finishShape(path);
       }
     });
-
     return () => { clickL.remove(); dblL.remove(); };
-
-    function clearShapeOnly() {
-      if (polygon.current) { polygon.current.setMap(null); polygon.current = null; }
-      if (tempPath.current) { tempPath.current.setMap(null); tempPath.current = null; }
-      vertexDots.current.forEach((d) => d.setMap(null)); vertexDots.current = [];
-    }
   }, [ready, mode, finishShape]);
 
-  /* ---- box drawing: click two corners ---- */
   useEffect(() => {
     if (!ready || mode !== "box") return;
     const m = maps.current, gmap = map.current;
     let first = null, rect = null;
     if (polygon.current) { polygon.current.setMap(null); polygon.current = null; }
-
     const clickL = gmap.addListener("click", (e) => {
       const pt = { lat: e.latLng.lat(), lng: e.latLng.lng() };
       if (!first) { first = pt; return; }
-      const path = [
-        { lat: first.lat, lng: first.lng },
-        { lat: first.lat, lng: pt.lng },
-        { lat: pt.lat, lng: pt.lng },
-        { lat: pt.lat, lng: first.lng },
-      ];
-      setMode(null);
-      finishShape(path);
+      const path = [{ lat: first.lat, lng: first.lng }, { lat: first.lat, lng: pt.lng }, { lat: pt.lat, lng: pt.lng }, { lat: pt.lat, lng: first.lng }];
+      setMode(null); if (rect) rect.setMap(null); finishShape(path);
     });
     const moveL = gmap.addListener("mousemove", (e) => {
       if (!first) return;
       const pt = { lat: e.latLng.lat(), lng: e.latLng.lng() };
-      const path = [
-        { lat: first.lat, lng: first.lng }, { lat: first.lat, lng: pt.lng },
-        { lat: pt.lat, lng: pt.lng }, { lat: pt.lat, lng: first.lng },
-      ];
+      const path = [{ lat: first.lat, lng: first.lng }, { lat: first.lat, lng: pt.lng }, { lat: pt.lat, lng: pt.lng }, { lat: pt.lat, lng: first.lng }];
       if (rect) rect.setMap(null);
       rect = new m.Polygon({ paths: path, map: gmap, strokeColor: C.accent, strokeWeight: 2, fillColor: C.accent, fillOpacity: 0.1, clickable: false });
     });
     return () => { clickL.remove(); moveL.remove(); if (rect) rect.setMap(null); };
   }, [ready, mode, finishShape]);
 
-  /* ---- render board leads as pins ---- */
   useEffect(() => {
     if (!ready) return;
     const m = maps.current;
     leadPins.current.forEach((p) => p.setMap(null)); leadPins.current = [];
-    const color = { jackie: "#7c3aed", needsAttention: C.accent, booked: "#0a8a4a" };
+    const color = { jackie: "#7c3aed", needsAttention: C.accent, booked: C.green };
     boardLeads.forEach((l) => {
       if (l.lat == null || l.lng == null) return;
-      const pin = new m.Marker({
-        position: { lat: l.lat, lng: l.lng }, map: map.current, title: l.name,
-        icon: { path: m.SymbolPath.CIRCLE, scale: 7, fillColor: color[l.stage] || C.accent, fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2 },
-      });
+      const pin = new m.Marker({ position: { lat: l.lat, lng: l.lng }, map: map.current, title: l.name, icon: { path: m.SymbolPath.CIRCLE, scale: 7, fillColor: color[l.stage] || C.accent, fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2 } });
       pin.addListener("click", () => onOpenLead && onOpenLead(l.id));
       leadPins.current.push(pin);
     });
   }, [ready, boardLeads, onOpenLead]);
 
-  /* ---- focus / pan to a lead ---- */
   useEffect(() => {
     if (!ready || !focusLead || focusLead.lat == null) return;
     map.current.panTo({ lat: focusLead.lat, lng: focusLead.lng });
     map.current.setZoom(16);
   }, [ready, focusLead]);
 
-  const included = captured.filter((h) => !excluded[h.id]);
+  const includedRevealed = revealed.filter((r) => !excluded[r.id]);
+  const includedCand = candidates.filter((c) => !excluded[c.id]);
 
   const create = async () => {
-    if (!included.length) return;
-    setBusy(true);
+    if (!includedRevealed.length) return;
+    setCreated("saving");
     try {
       await onCreateGroup({
-        name: groupName.trim() || `Reveal Group ${new Date().toLocaleDateString()}`,
-        contacts: included.length,
-        source: "Reveal",
-        prospects: included.map((h) => ({
-          name: h.name, addr: h.addr, phone: h.phone, email: null,
-          value: h.value, equity: h.equity, beds: h.beds, sqft: h.sqft, year: h.year,
-          lat: h.lat, lng: h.lng,
-        })),
+        name: groupName.trim() || `Reveal ${new Date().toLocaleDateString()}`,
+        contacts: includedRevealed.length, source: "Reveal",
+        prospects: includedRevealed.map((r) => ({ name: r.name, addr: r.addr, phone: r.phone, email: r.email, value: r.value, equity: r.equity, beds: r.beds, sqft: r.sqft, year: r.year, lat: r.lat, lng: r.lng })),
       });
       setCreated(true);
-    } finally { setBusy(false); }
+    } catch { setCreated(false); }
   };
 
-  /* ---- missing key fallback ---- */
-  if (err === "no-key") {
-    return (
-      <div style={{ padding: 40, fontFamily: "system-ui", color: C.sub }}>
-        <h3 style={{ color: C.ink }}>Google Maps key not set</h3>
-        <p>Add <code>VITE_GOOGLE_MAPS_KEY</code> in Vercel (and your local <code>.env</code>), then redeploy.</p>
-      </div>
-    );
-  }
+  if (err === "no-key") return <div style={{ padding: 40, fontFamily: "system-ui", color: C.sub }}><h3 style={{ color: C.ink }}>Google Maps key not set</h3><p>Add <code>VITE_GOOGLE_MAPS_KEY</code> in Vercel, then redeploy.</p></div>;
 
   return (
     <div style={{ display: "flex", gap: 16, height: "calc(100vh - 40px)", fontFamily: "system-ui" }}>
-      {/* map + toolbar */}
       <div style={{ flex: 1, position: "relative", borderRadius: 16, overflow: "hidden", border: `1px solid ${C.line}` }}>
-        <div style={{ position: "absolute", zIndex: 5, top: 14, left: 14, display: "flex", gap: 8 }}>
+        <div style={{ position: "absolute", zIndex: 5, top: 14, left: 14, display: "flex", gap: 8, flexWrap: "wrap", maxWidth: "85%" }}>
           <Btn on={mode === "polygon"} onClick={() => setMode("polygon")}>✎ Draw polygon</Btn>
           <Btn on={mode === "box"} onClick={() => setMode("box")}>▭ Draw box</Btn>
           <Btn onClick={clearDrawing}>↺ Clear</Btn>
-          {mode && <span style={{ alignSelf: "center", background: "#1d2939", color: "#fff", fontSize: 12.5, padding: "6px 10px", borderRadius: 8 }}>
-            {mode === "polygon" ? "Click points · double-click to close" : "Click two corners"}
-          </span>}
+          {mode && <span style={{ alignSelf: "center", background: "#1d2939", color: "#fff", fontSize: 12.5, padding: "6px 10px", borderRadius: 8 }}>{mode === "polygon" ? "Click points · double-click to close" : "Click two corners"}</span>}
         </div>
         <div ref={mapEl} style={{ width: "100%", height: "100%", background: "#e9eef2" }} />
         {!ready && !err && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: C.sub }}>Loading map…</div>}
-        {err === "load-failed" && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "#b42318" }}>Map failed to load — check the key & allowed referrers.</div>}
+        {err === "load-failed" && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: C.red }}>Map failed to load — check the key & allowed referrers.</div>}
       </div>
 
-      {/* review panel */}
-      <div style={{ width: 360, border: `1px solid ${C.line}`, borderRadius: 16, background: "#fff", display: "flex", flexDirection: "column" }}>
+      <div style={{ width: 380, border: `1px solid ${C.line}`, borderRadius: 16, background: "#fff", display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "16px 18px", borderBottom: `1px solid ${C.line}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <strong style={{ color: C.ink }}>Prospect Group</strong>
-          <span style={{ color: C.accent, fontWeight: 700 }}>{included.length}</span>
+          <span style={{ color: C.accent, fontWeight: 700 }}>{phase === "revealed" ? includedRevealed.length : includedCand.length}</span>
         </div>
-        {busy && <div style={{ padding: 18, color: C.sub }}>Revealing homeowners…</div>}
-        {!busy && captured.length === 0 && (
-          <div style={{ padding: 30, color: C.sub, textAlign: "center", margin: "auto" }}>
-            Pick <b>Draw polygon</b> or <b>Draw box</b>, then outline an area to reveal the homeowners inside.
-          </div>
-        )}
-        <div style={{ overflowY: "auto", flex: 1, padding: captured.length ? 12 : 0 }}>
-          {captured.map((h) => {
-            const off = excluded[h.id];
-            return (
-              <div key={h.id} style={{ border: `1px solid ${off ? C.line : C.accent}`, opacity: off ? 0.5 : 1, borderRadius: 12, padding: 12, marginBottom: 10 }}>
+        {note && <div style={{ padding: "10px 16px", fontSize: 12.5, color: C.sub, background: "#fbf7f2" }}>{note}</div>}
+        {phase === "sampling" && <Progress label="Finding addresses in area…" {...progress} />}
+        {phase === "revealing" && <Progress label="Revealing owners (Tracerfy)…" {...progress} />}
+        {phase === "idle" && <div style={{ padding: 30, color: C.sub, textAlign: "center", margin: "auto" }}>Pick <b>Draw polygon</b> or <b>Draw box</b>, then outline an area. We'll find the addresses inside, then you Reveal the owners.</div>}
+
+        {phase === "candidates" && (<>
+          <div style={{ overflowY: "auto", flex: 1, padding: 12 }}>
+            {candidates.map((c) => { const off = excluded[c.id]; return (
+              <div key={c.id} style={{ border: `1px solid ${off ? C.line : C.accent}`, opacity: off ? 0.5 : 1, borderRadius: 12, padding: 12, marginBottom: 8 }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <strong style={{ color: C.ink }}>{h.name}</strong>
-                  <button onClick={() => setExcluded((p) => ({ ...p, [h.id]: !p[h.id] }))}
-                    style={{ border: "none", background: "none", cursor: "pointer", color: C.sub }}>{off ? "undo" : "🗑"}</button>
+                  <span style={{ color: C.ink, fontWeight: 600 }}>{c.addr}</span>
+                  <button onClick={() => setExcluded((p) => ({ ...p, [c.id]: !p[c.id] }))} style={{ border: "none", background: "none", cursor: "pointer", color: C.sub }}>{off ? "undo" : "🗑"}</button>
                 </div>
-                <div style={{ fontSize: 13, color: C.sub, margin: "4px 0" }}>{h.addr}</div>
-                <div style={{ fontSize: 13, display: "flex", gap: 12 }}>
-                  <span>📞 {h.phone}</span><span>$ ${Math.round(h.value / 1000)}k</span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        {captured.length > 0 && (
-          <div style={{ padding: 14, borderTop: `1px solid ${C.line}` }}>
-            <input value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Group name (e.g. Laureate Q2)"
-              style={{ width: "100%", padding: "10px 12px", border: `1px solid ${C.line}`, borderRadius: 10, marginBottom: 10, fontSize: 14 }} />
-            <button onClick={create} disabled={!included.length || busy || created}
-              style={{ width: "100%", padding: "12px", border: "none", borderRadius: 10, background: created ? "#0a8a4a" : C.accent, color: "#fff", fontWeight: 700, fontSize: 15, cursor: "pointer" }}>
-              {created ? "✓ Group created" : busy ? "Saving…" : `Create Group (${included.length})`}
-            </button>
+                <div style={{ fontSize: 12.5, color: C.sub }}>{c.city}, {c.state} {c.zip}</div>
+              </div>); })}
           </div>
-        )}
+          <div style={{ padding: 14, borderTop: `1px solid ${C.line}` }}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 8 }}>{includedCand.length} addresses · ~$0.20 each to reveal (charged only on a match)</div>
+            <button onClick={reveal} disabled={!includedCand.length} style={{ width: "100%", padding: 12, border: "none", borderRadius: 10, background: C.accent, color: "#fff", fontWeight: 700, fontSize: 15, cursor: "pointer" }}>Reveal {includedCand.length} owners</button>
+          </div>
+        </>)}
+
+        {phase === "revealed" && (<>
+          <div style={{ overflowY: "auto", flex: 1, padding: 12 }}>
+            {revealed.map((r) => { const off = excluded[r.id]; return (
+              <div key={r.id} style={{ border: `1px solid ${off ? C.line : C.accent}`, opacity: off ? 0.5 : 1, borderRadius: 12, padding: 12, marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <strong style={{ color: C.ink }}>{r.name}</strong>
+                  <button onClick={() => setExcluded((p) => ({ ...p, [r.id]: !p[r.id] }))} style={{ border: "none", background: "none", cursor: "pointer", color: C.sub }}>{off ? "undo" : "🗑"}</button>
+                </div>
+                <div style={{ fontSize: 13, color: C.sub, margin: "4px 0" }}>{r.addr}</div>
+                <div style={{ fontSize: 13, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  {r.phone ? <span>📞 {r.phone}</span> : <span style={{ color: C.red }}>no callable #</span>}
+                  {r.value ? <span>${Math.round(r.value / 1000)}k</span> : null}
+                  {r.dnc && <span style={{ background: "#fde8e8", color: C.red, fontSize: 11, padding: "1px 6px", borderRadius: 6 }}>DNC</span>}
+                  {r.roofCat && <span style={{ background: "#eef2ff", color: "#3538cd", fontSize: 11, padding: "1px 6px", borderRadius: 6 }}>roof: {r.roofCat}</span>}
+                </div>
+              </div>); })}
+            {!revealed.length && <div style={{ padding: 24, color: C.sub, textAlign: "center" }}>No owners revealed.</div>}
+          </div>
+          {revealed.length > 0 && (
+            <div style={{ padding: 14, borderTop: `1px solid ${C.line}` }}>
+              <input value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Group name (e.g. Laureate Q2)" style={{ width: "100%", padding: "10px 12px", border: `1px solid ${C.line}`, borderRadius: 10, marginBottom: 10, fontSize: 14 }} />
+              <button onClick={create} disabled={!includedRevealed.length || created === "saving" || created === true} style={{ width: "100%", padding: 12, border: "none", borderRadius: 10, background: created === true ? C.green : C.accent, color: "#fff", fontWeight: 700, fontSize: 15, cursor: "pointer" }}>{created === true ? "✓ Group created" : created === "saving" ? "Saving…" : `Create Group (${includedRevealed.length})`}</button>
+            </div>
+          )}
+        </>)}
       </div>
     </div>
   );
 }
 
+function Progress({ label, done, total }) {
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  return (<div style={{ padding: 24, margin: "auto", textAlign: "center", color: C.sub }}>
+    <div style={{ marginBottom: 10 }}>{label}</div>
+    <div style={{ height: 8, background: C.line, borderRadius: 8, overflow: "hidden" }}><div style={{ width: pct + "%", height: "100%", background: C.accent, transition: "width .2s" }} /></div>
+    <div style={{ fontSize: 12.5, marginTop: 6 }}>{done} / {total}</div>
+  </div>);
+}
 function Btn({ children, on, onClick }) {
-  return (
-    <button onClick={onClick} style={{
-      padding: "9px 13px", border: `1px solid ${on ? C.accent : C.line}`, borderRadius: 10,
-      background: on ? C.accent : "#fff", color: on ? "#fff" : C.ink, fontWeight: 600, fontSize: 13.5, cursor: "pointer",
-    }}>{children}</button>
-  );
+  return <button onClick={onClick} style={{ padding: "9px 13px", border: `1px solid ${on ? C.accent : C.line}`, borderRadius: 10, background: on ? C.accent : "#fff", color: on ? "#fff" : C.ink, fontWeight: 600, fontSize: 13.5, cursor: "pointer" }}>{children}</button>;
 }
