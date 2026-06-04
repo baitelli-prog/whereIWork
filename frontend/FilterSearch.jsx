@@ -74,7 +74,6 @@ export default function FilterSearch({ onCreateGroup }) {
     return () => { dead = true; };
   }, [key]);
 
-  // draw center + radius circle
   useEffect(() => {
     if (!ready || areaMode !== "radius") return;
     const m = maps.current;
@@ -184,7 +183,6 @@ export default function FilterSearch({ onCreateGroup }) {
         </div>
 
         <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
-          {/* area mode */}
           <div style={{ display: "flex", gap: 8 }}>
             <Tab on={areaMode === "radius"} onClick={() => setAreaMode("radius")}>Radius</Tab>
             <Tab on={areaMode === "zips"} onClick={() => setAreaMode("zips")}>ZIP codes</Tab>
@@ -197,7 +195,6 @@ export default function FilterSearch({ onCreateGroup }) {
             <input value={zips} onChange={(e) => setZips(e.target.value)} placeholder="32801, 32803, 32806" style={{ padding: "10px 12px", border: `1px solid ${C.line}`, borderRadius: 10, fontSize: 14 }} />
           )}
 
-          {/* filters */}
           <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
             <div style={{ fontSize: 12.5, fontWeight: 700, color: C.ink, marginBottom: 8 }}>FILTERS</div>
             <Check label="🏊 Has a pool" v={pool} set={setPool} />
@@ -210,12 +207,10 @@ export default function FilterSearch({ onCreateGroup }) {
 
           {err && <div style={{ background: "#fde8e8", color: C.red, fontSize: 12.5, padding: 10, borderRadius: 8 }}>{err}</div>}
 
-          {/* preview button */}
           <button onClick={doPreview} disabled={!canSearch || phase === "previewing"} style={{ padding: 12, border: `1px solid ${C.accent}`, borderRadius: 10, background: "#fff", color: C.accent, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>
             {phase === "previewing" ? "Checking…" : "Preview (free)"}
           </button>
 
-          {/* preview result */}
           {phase === "previewed" && preview && (
             <div style={{ background: C.panel, borderRadius: 10, padding: 12, fontSize: 13.5 }}>
               <div><b style={{ color: C.ink }}>{preview.count?.toLocaleString()}</b> homes match</div>
@@ -226,7 +221,6 @@ export default function FilterSearch({ onCreateGroup }) {
             </div>
           )}
 
-          {/* executing */}
           {phase === "executing" && (
             <div style={{ textAlign: "center", color: C.sub, padding: 10 }}>
               <div style={{ marginBottom: 8 }}>Building… {stage}</div>
@@ -236,7 +230,6 @@ export default function FilterSearch({ onCreateGroup }) {
           )}
         </div>
 
-        {/* results */}
         {phase === "done" && (
           <div style={{ borderTop: `1px solid ${C.line}`, display: "flex", flexDirection: "column", flex: 1 }}>
             <div style={{ padding: "10px 16px", fontSize: 13, color: C.sub }}>{included.length} of {rows.length} included</div>
