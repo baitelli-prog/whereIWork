@@ -2,6 +2,7 @@ import React, { useState, useMemo } from "react";
 import { useGlassHouse } from "./hooks/useGlassHouse";
 import { fetchGroupProspects } from "./lib/db";
 import RevealMap from "./RevealMap";
+import FilterSearch from "./FilterSearch";
 
 const HAS_MAPS_KEY = !!import.meta.env.VITE_GOOGLE_MAPS_KEY;
 import {
@@ -36,6 +37,7 @@ const body = `ui-sans-serif, -apple-system, 'Segoe UI', Roboto, sans-serif`;
 
 const NAV = [
   { id: "reveal", label: "Reveal", icon: Map },
+  { id: "filtersearch", label: "Filter Search", icon: Filter },
   { id: "reengage", label: "ReEngage", icon: RefreshCw },
   { id: "outreach", label: "Outreach", icon: Send },
   { id: "salesboard", label: "Sales Board", icon: Columns },
@@ -489,7 +491,7 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
     setExporting(g.id);
     try {
       const rows = await fetchGroupProspects(g.id);
-      const header = ["first_name", "last_name", "full_name", "address", "city", "state", "zip", "phone", "pool"];
+      const header = ["first_name", "last_name", "full_name", "address", "city", "state", "zip", "phone", "email", "pool"];
       const out = [header];
       rows.forEach((p) => {
         const parts = (p.name || "").trim().split(" ");
@@ -498,7 +500,7 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
         const [street, city, stateZip] = (p.address || "").split(",").map((s) => s.trim());
         const [st, zip] = (stateZip || "").split(" ").filter(Boolean);
         const safePhone = p.dnc ? "" : (p.phone || "");
-        out.push([first, last, p.name || "", street || "", city || "", st || "", zip || "", safePhone, p.has_pool ? "Yes" : "No"]);
+        out.push([first, last, p.name || "", street || "", city || "", st || "", zip || "", safePhone, p.email || "", p.has_pool ? "Yes" : "No"]);
       });
       const csv = out.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
       const blob = new Blob([csv], { type: "text/csv" });
@@ -1079,6 +1081,7 @@ export default function App() {
       case "reveal": return HAS_MAPS_KEY
         ? <RevealMap onCreateGroup={addGroup} boardLeads={allLeads} focusLead={focusLeadObj} onOpenLead={openLead} clearFocus={() => setFocusLeadId(null)} />
         : <Reveal onCreateGroup={addGroup} goOutreach={() => { setActive("outreach"); setSettingsActive(false); }} boardLeads={allLeads} focusLead={focusLeadObj} onOpenLead={openLead} clearFocus={() => setFocusLeadId(null)} />;
+      case "filtersearch": return <FilterSearch onCreateGroup={addGroup} />;
       case "reengage": return <ReEngage />;
       case "outreach": return <Outreach groups={groups} onSend={sendCampaign} sentGroupNames={sentGroupNames} />;
       case "salesboard": return <SalesBoard campaigns={campaigns} leads={leads} goOutreach={() => { setActive("outreach"); setSettingsActive(false); }} onMove={moveLead} onOpen={openLead} onViewMap={viewLeadOnMap} onReset={refresh} />;
@@ -1089,7 +1092,7 @@ export default function App() {
     }
   }, [active, settingsActive, groups, campaigns, leads, focusLeadObj]);
 
-  const fullBleed = active === "reveal" && !settingsActive;
+  const fullBleed = (active === "reveal" || active === "filtersearch") && !settingsActive;
 
   if (loading) {
     return (
