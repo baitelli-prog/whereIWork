@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { useGlassHouse } from "./hooks/useGlassHouse";
+import { fetchGroupProspects } from "./lib/db";
 import RevealMap from "./RevealMap";
 
 const HAS_MAPS_KEY = !!import.meta.env.VITE_GOOGLE_MAPS_KEY;
@@ -9,7 +10,7 @@ import {
   Users, MapPin, Phone, Sparkles, X, Filter, Pencil, Building2,
   Crosshair, ChevronDown, Upload, Bookmark, Mail, Clock, Check,
   Square, Home, DollarSign, Bed, Ruler, CalendarDays, Trash2, RotateCcw,
-  TrendingUp, CalendarCheck, Reply, Send as SendIcon, CornerDownLeft,
+  TrendingUp, CalendarCheck, Reply, Send as SendIcon, CornerDownLeft, Download,
 } from "lucide-react";
 
 /* ----------------------------------------------------------------
@@ -482,6 +483,36 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
   const [tab, setTab] = useState(0);
   const [q, setQ] = useState("");
   const [composing, setComposing] = useState(null); // group obj
+  const [exporting, setExporting] = useState(null);  // group id being exported
+
+  const exportGroup = async (g) => {
+    setExporting(g.id);
+    try {
+      const rows = await fetchGroupProspects(g.id);
+      const header = ["first_name", "last_name", "full_name", "address", "city", "state", "zip", "phone", "pool"];
+      const out = [header];
+      rows.forEach((p) => {
+        const parts = (p.name || "").trim().split(" ");
+        const first = parts[0] || "";
+        const last = parts.slice(1).join(" ");
+        const [street, city, stateZip] = (p.address || "").split(",").map((s) => s.trim());
+        const [st, zip] = (stateZip || "").split(" ").filter(Boolean);
+        const safePhone = p.dnc ? "" : (p.phone || "");
+        out.push([first, last, p.name || "", street || "", city || "", st || "", zip || "", safePhone, p.has_pool ? "Yes" : "No"]);
+      });
+      const csv = out.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `${(g.name || "group").replace(/\s+/g, "-")}-list.csv`;
+      a.click(); URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Export failed: " + (e.message || e));
+    } finally {
+      setExporting(null);
+    }
+  };
+
   const filtered = groups.filter((g) =>
     (tab === 0 || g.source === tabs[tab]) &&
     g.name.toLowerCase().includes(q.toLowerCase())
@@ -502,7 +533,7 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
             <Search size={15} color={C.sub} /><input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search prospect groups…" style={{ border: "none", background: "none", outline: "none", fontSize: 14 }} />
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.8fr 1fr", padding: "14px 18px", fontSize: 13, fontWeight: 700, color: C.ink, borderBottom: `1px solid ${C.line}` }}>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.8fr 1.7fr", padding: "14px 18px", fontSize: 13, fontWeight: 700, color: C.ink, borderBottom: `1px solid ${C.line}` }}>
           <span>Prospect Group Name</span><span>Contacts</span><span>Date Created</span><span>Status</span><span>Source</span><span style={{ textAlign: "right" }}>Action</span>
         </div>
         {filtered.length === 0 ? (
@@ -512,7 +543,7 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
         ) : filtered.map((g, i) => {
           const sent = sentGroupNames.includes(g.name);
           return (
-          <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.8fr 1fr", padding: "16px 18px", alignItems: "center", borderBottom: `1px solid ${C.line}`, fontSize: 14.5 }}>
+          <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.8fr 1.7fr", padding: "16px 18px", alignItems: "center", borderBottom: `1px solid ${C.line}`, fontSize: 14.5 }}>
             <span style={{ fontWeight: 700, color: C.ink, display: "flex", alignItems: "center", gap: 9 }}>
               <span style={{ width: 30, height: 30, borderRadius: 8, background: C.accentSoft, display: "grid", placeItems: "center" }}><Map size={15} color={C.accent} /></span>
               {g.name}
@@ -521,7 +552,10 @@ function Outreach({ groups = [], onSend, sentGroupNames = [] }) {
             <span style={{ color: C.sub }}>{g.date}</span>
             <span><Pill tone={sent ? "green" : "amber"}>{sent ? "Sent" : "Ready to send"}</Pill></span>
             <span style={{ color: C.sub }}>{g.source}</span>
-            <span style={{ textAlign: "right" }}>
+            <span style={{ textAlign: "right", display: "inline-flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => exportGroup(g)} disabled={exporting === g.id} title="Export mailing list CSV" style={{ background: "#fff", color: C.ink, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 12px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <Download size={14} /> {exporting === g.id ? "…" : "Export"}
+              </button>
               <button onClick={() => setComposing(g)} style={{ background: sent ? "#fff" : C.accent, color: sent ? C.accent : "#fff", border: sent ? `1px solid ${C.accent}` : "none", borderRadius: 8, padding: "8px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
                 <Send size={14} /> {sent ? "Send again" : "Compose"}
               </button>
