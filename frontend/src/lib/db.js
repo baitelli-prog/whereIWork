@@ -22,6 +22,16 @@ export async function fetchGroups() {
   }));
 }
 
+// All prospects for one group — used by the Outreach CSV export.
+export async function fetchGroupProspects(group_id) {
+  const { data, error } = await supabase
+    .from("prospects")
+    .select("name, address, phone, email, home_value, dnc, has_pool")
+    .eq("group_id", group_id);
+  if (error) throw error;
+  return data || [];
+}
+
 export async function fetchCampaigns() {
   const { data, error } = await supabase
     .from("campaigns")
@@ -92,7 +102,7 @@ export async function createGroup({ name, source = "Reveal", geometry, prospects
       group_id: group.id, company_id,
       name: p.name, address: p.addr, phone: p.phone, email: p.email ?? null,
       home_value: p.value, equity: p.equity, beds: p.beds, sqft: p.sqft, year_built: p.year,
-      lat: p.lat, lng: p.lng, dnc: false,
+      lat: p.lat, lng: p.lng, dnc: p.dnc ?? false, has_pool: p.hasPool ?? false,
     }));
     const { error: pErr } = await supabase.from("prospects").insert(rows);
     if (pErr) throw pErr;
